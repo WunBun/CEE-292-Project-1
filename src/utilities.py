@@ -30,14 +30,67 @@ plt.rcParams["axes3d.mouserotationstyle"] = "azel"
 # %%
 
 
-def fast_loader(ds, batch_size, shuffle):
-    base = RandomSampler(ds) if shuffle else SequentialSampler(ds)
-    return DataLoader(
-        ds, sampler=BatchSampler(base, batch_size, drop_last=False), batch_size=None
-    )
+class TensorBatches:  # a fast batched data loader that avoids torch overhead
+    def __init__(self, ds, batch_size, shuffle=False):
+        if isinstance(ds, torch.utils.data.Subset):
+            self.tensors = [t[ds.indices] for t in ds.dataset.tensors]
+        else:
+            self.tensors = list(ds.tensors)
+        self.n, self.bs, self.shuffle = len(self.tensors[0]), batch_size, shuffle
+
+    def __len__(self):
+        return (self.n + self.bs - 1) // self.bs
+
+    def __iter__(self):
+        idx = torch.randperm(self.n) if self.shuffle else None
+        for s in range(0, self.n, self.bs):
+            if idx is None:
+                yield tuple(t[s : s + self.bs] for t in self.tensors)
+            else:
+                b = idx[s : s + self.bs]
+                yield tuple(t[b] for t in self.tensors)
 
 
-def setdiff1d_t(t1, t2):
+class FDMSolve(
+    torch.autograd.Function
+):  # adjunct for derivative of FDM solve for faster training
+    """
+    Solves Dn(q) X = rhs with Dn assembled sparsely from q.
+    The backward pass computes only the entries of dL/dDn that q touches,
+    instead of the full outer product.
+
+    Not in use yet lmao
+    """
+
+    @staticmethod
+    def forward(ctx, q_vecs, rhs, mesh):
+        B, F = q_vecs.shape[0], mesh.n_free
+
+        vals = q_vecs[:, mesh.Dn_edge] * mesh.Dn_sign
+        Dn = torch.zeros(B, F * F, dtype=q_vecs.dtype, device=q_vecs.device)
+        Dn.index_add_(1, mesh.Dn_flat, vals)
+
+        LU, piv, info = torch.linalg.lu_factor_ex(Dn.view(B, F, F))
+        X = torch.linalg.lu_solve(LU, piv, rhs)
+
+        ctx.save_for_backward(LU, piv, X)
+        ctx.mesh = mesh
+        return X
+
+    @staticmethod
+    def backward(ctx, gX):
+        LU, piv, X = ctx.saved_tensors
+        m = ctx.mesh
+
+        gB = torch.linalg.lu_solve(LU, piv, gX, adjoint=True)
+        g_vals = -(gB[:, m.Dn_i, :] * X[:, m.Dn_j, :]).sum(-1)
+        g_q = torch.zeros(gX.shape[0], m.n_edges, dtype=gX.dtype, device=gX.device)
+        g_q.index_add_(1, m.Dn_edge, g_vals * m.Dn_sign)
+
+        return g_q, gB, None
+
+
+def setdiff1d_t(t1, t2):  # helper function
     mask = ~torch.isin(t1, t2)
     return t1[mask]
 
@@ -148,6 +201,13 @@ class MeshData:
         self.Dn_edge = e_idx  # which edge each entry comes from
         self.Dn_flat = i_idx * self.n_free + j_idx  # where it lands in flattened Dn
         self.Dn_sign = outer[e_idx, i_idx, j_idx]  # +1 or -1
+        self.Dn_i = i_idx
+        self.Dn_j = j_idx
+
+        M = self.CnT.unsqueeze(2) * self.CfXf.unsqueeze(0)
+        M = M.permute(1, 0, 2).reshape(self.n_edges, self.n_free * 3)
+        self.bnd_edges = M.abs().sum(1).nonzero().squeeze(1)  # boundary edges
+        self.rhs_map = M[self.bnd_edges].contiguous()
 
     def eq_shape(self, q_vec, p_mat):
         """
@@ -214,29 +274,20 @@ class MeshData:
 
         n_batches = q_vecs.shape[0]
 
-        CnT_q = self.CnT.unsqueeze(0) * q_vecs.unsqueeze(
-            1
-        )  # n_batches x n_free x n_edges
-
         vals = q_vecs[:, self.Dn_edge] * self.Dn_sign
         Dn = torch.zeros(
             n_batches, self.n_free**2, dtype=q_vecs.dtype, device=q_vecs.device
         )
-        Dn = Dn.index_add(1, self.Dn_flat, vals).view(
-            n_batches, self.n_free, self.n_free
-        )
+        Dn.index_add_(1, self.Dn_flat, vals)
+        Dn = Dn.view(n_batches, self.n_free, self.n_free)
 
-        # Dn = CnT_q @ self.Cn  # n_batches x n_free x n_free
-
-        # print(f"{p_mats.shape=}")
-        # print(f"{CnT_q.shape=}")
-        # print(f"{self.CfXf.shape=}")
-
-        rhs = -p_mats - self.CnT @ (
-            q_vecs.unsqueeze(2) * self.CfXf
+        rhs = -p_mats - (q_vecs[:, self.bnd_edges] @ self.rhs_map).view(
+            n_batches, self.n_free, 3
         )  # n_batches x n_free x 3
 
         X_free_eq = torch.linalg.solve(Dn, rhs)  # n_batches x n_free x 3
+
+        # X_free_eq = FDMSolve.apply(q_vecs, rhs, self)
 
         X_eq = self.X.unsqueeze(0).expand(n_batches, -1, -1).clone()
         X_eq[:, self.free_ind, :] = X_free_eq
@@ -633,9 +684,10 @@ def pointwise_Lp_loss(model, Xs_train, _, p=2, trial_q=None):
     loss = err.abs().pow(p).sum(dim=(1, 2)).mean()
 
     err_free = err[:, model.topology.free_ind, :]
+    err_free_norm = torch.linalg.norm(err_free, dim=2)
 
-    mean_dist = torch.linalg.norm(err_free, dim=2).mean()
-    max_dist = torch.linalg.norm(err_free, dim=2).amax()
+    mean_dist = err_free_norm.mean()
+    max_dist = err_free_norm.amax()
 
     return loss, {"mean_dist": mean_dist.item(), "max_dist": max_dist.item()}
 
@@ -728,6 +780,7 @@ def train_adaptive(
     data_loss_fn,
     data,
     data_generator=None,
+    refresh_every=5,  # how often to generate new training data
     data_loss_parameters=(),
     train_val_test=(0.8, 0.1, 0.1),
     batch_size=128,
@@ -825,9 +878,9 @@ def train_adaptive(
         generator=torch.Generator().manual_seed(1),
     )
 
-    train_loader = fast_loader(train, batch_size=batch_size, shuffle=len(train) > 0)
-    val_loader = fast_loader(val, batch_size=batch_size, shuffle=False)
-    test_loader = fast_loader(test, batch_size=batch_size, shuffle=False)
+    train_loader = TensorBatches(train, batch_size=batch_size, shuffle=len(train) > 0)
+    val_loader = TensorBatches(val, batch_size=batch_size, shuffle=False)
+    test_loader = TensorBatches(test, batch_size=batch_size, shuffle=False)
 
     history["train_inds"] = train.indices
     history["val_inds"] = val.indices
@@ -890,13 +943,13 @@ def train_adaptive(
 
         metrics = defaultdict(int)
 
-        if data_generator is not None:
+        if data_generator is not None and epoch % refresh_every == 0:
             # replace whatever is in train_loader with newly-generated training data
             x_train, y_train = data_generator.sample_batch(
                 batch_size * batches_per_epoch
             )
             epoch_train_dataset = TensorDataset(x_train, y_train)
-            train_loader = fast_loader(
+            train_loader = TensorBatches(
                 epoch_train_dataset, batch_size=batch_size, shuffle=True
             )
 
@@ -1090,170 +1143,6 @@ def train_adaptive(
             history[f"{k}_test"].append(metrics[k] / len(test_loader))
 
     return history
-
-
-# def train_pinn_adaptive(
-#     model,
-#     data_loss_fn,
-#     train_sampler,
-#     x_test,
-#     # y_train,
-#     data_loss_parameters=(),
-#     physics_loss_fn=lambda m, t: torch.zeros(()),
-#     t_colloc=None,
-#     physics_loss_parameters=(),
-#     bc_loss_fn=lambda m, x, u: torch.zeros(()),
-#     t_bc=None,
-#     u_bc=None,
-#     epochs=1000,
-#     lr=1e-3,
-#     weighting=None,
-#     data_start=0,
-#     batch_size=128,
-#     batches_per_epoch=20,
-#     eval_every=10,
-# ):
-#     """
-#     Train a physics-informed neural network with physics and boundary condition loss
-#     Weights are adaptive
-#     No training data
-
-#     Args:
-#         model: Neural network
-#         t_colloc: Collocation points for physics
-#         t_bc: Boundary condition points
-#         physics_loss, bc_loss: loss functions to use for physics and bcs
-#         physics_loss_parameters: parameters passed to physics_loss()
-#             q: function of x that returns the heat source at a location x
-#             kappa: system parameter
-#         lambda_physics, lambda_bcs: balance parameters
-#     """
-#     weighting = weighting or LossWeighting()
-
-#     # choose optimizer
-#     optimizer = optim.Adam(model.parameters(), lr=lr)
-
-#     history = {
-#         "data_train": [],
-#         "physics_train": [],
-#         "bcs_train": [],
-#         "total_train": [],
-#         #
-#         "data_test": [],
-#         #
-#         "val_mae": [],
-#         "val_rmse": [],
-#         "val_max_err": [],
-#         #
-#         "data_weight": [],
-#         "physics_weight": [],
-#         "bcs_weight": [],
-#         #
-#         "best_state": None,
-#         "best_metric": float("inf"),
-#         "best_epoch": 0,
-#     }
-
-#     # set normalization scale
-#     X_normalize, _ = train_sampler.sample_batch(batch_size * batches_per_epoch)
-
-#     model.set_input_normalization(X_normalize.reshape(X_normalize.shape[0], -1))
-
-#     # train!
-
-#     pbar = tqdm(range(epochs), desc="Training PINN")
-
-#     for epoch in pbar:
-#         # each epoch will shuffle the training data
-#         # then do several optimizer steps over mini-batches
-
-#         for batch_idx in range(batches_per_epoch):
-#             optimizer.zero_grad()
-#             weighting.zero_grad()
-
-#             # calculate data loss
-
-#             x_train, _ = train_sampler.sample_batch(batch_size)
-#             loss_data, mae, rmse, max_err = data_loss_fn(
-#                 model, x_train, *data_loss_parameters
-#             )
-
-#             # calculate physics loss
-
-#             loss_physics = physics_loss_fn(model, x_train, *physics_loss_parameters)
-
-#             # calculate BC loss
-#             loss_bcs = bc_loss_fn(model, t_bc, u_bc)
-
-#             # get weights
-#             w_data, w_physics, w_bcs = weighting(
-#                 loss_data, loss_physics, loss_bcs, model
-#             )
-
-#             history["data_weight"].append(float(w_data))
-#             history["physics_weight"].append(float(w_physics))
-#             history["bcs_weight"].append(float(w_bcs))
-
-#             # calculate total loss
-#             if epoch < data_start:
-#                 total_loss = (
-#                     (w_data + w_physics + w_bcs)
-#                     / (w_data + w_bcs)
-#                     * (w_data * loss_data + w_bcs * loss_bcs)
-#                 )
-#             else:
-#                 total_loss = (
-#                     w_data * loss_data + w_physics * loss_physics + w_bcs * loss_bcs
-#                 )
-
-#             # backpropagation
-#             total_loss.backward()
-#             optimizer.step()
-#             weighting.step()
-
-#         # store losses
-#         history["data_train"].append(loss_data.item())
-#         history["physics_train"].append(loss_physics.item())
-#         history["bcs_train"].append(loss_bcs.item())
-#         history["total_train"].append(total_loss.item())
-
-#         # calculate and store training loss every "eval_every" epochs
-#         if epoch % eval_every == 0 or epoch == epochs - 1:
-#             with torch.no_grad():
-#                 if x_test is None:
-#                     loss_data_test = torch.tensor(0.0)
-#                 else:
-#                     loss_data_test, mae, rmse, max_err = data_loss_fn(
-#                         model, x_test, *data_loss_parameters
-#                     )
-
-#                     history["val_mae"].append((epoch, mae))
-#                     history["val_rmse"].append((epoch, rmse))
-#                     history["val_max_err"].append((epoch, max_err))
-
-#                 history["data_test"].append((epoch, loss_data_test.item()))
-
-#             # keep the best model by validation loss
-#             metric = loss_data_test.item()
-
-#             if epoch >= data_start and metric < history["best_metric"]:
-#                 history["best_metric"] = metric
-#                 history["best_epoch"] = epoch
-#                 history["best_state"] = copy.deepcopy(model.state_dict())
-
-#         # log
-#         if (epoch % eval_every) == 0:
-#             pbar.set_postfix(
-#                 {
-#                     "Data": f"{loss_data.item():0.6f}",
-#                     "Physics": f"{loss_physics.item():0.6f}",
-#                     "BCs": f"{loss_bcs.item():0.6f}",
-#                     "Total": f"{total_loss.item():0.6f}",
-#                     "Validation": f"{loss_data_test.item():0.6f}",
-#                 }
-#             )
-
-#     return history
 
 
 # %%
