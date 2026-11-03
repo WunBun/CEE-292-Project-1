@@ -55,7 +55,6 @@ Since they use FDM, the resulting shape will be mechanically sound even if the n
 
 - Use tributary area iteration to tackle geometric nonlinearities
 
-
 - Use my existing grammar to generate a bunch of shells. Get their data and do a PCA to find out about how many dimensions I should use for the latent space.
 - Use a discontinuous activation function on the output, thus setting a minimum magnitude force density but allowing both positive and negative values
 

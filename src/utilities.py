@@ -298,7 +298,7 @@ class MeshData:
 # %%
 
 
-def visualize_mesh(mesh_data, X_eq=None, hat_X=None):
+def visualize_mesh(mesh_data, X_eq=None, hat_X=None, view=(30, -60)):
     """
     Plots the mesh from mesh_data
     """
@@ -315,8 +315,13 @@ def visualize_mesh(mesh_data, X_eq=None, hat_X=None):
     edge_inds = [np.where(C[i, :])[0] for i in range(n_edges)]
 
     fig, ax = plt.subplots(
-        1, 1, figsize=(8, 6), dpi=100, subplot_kw={"projection": "3d"}
+        1,
+        1,
+        figsize=(8, 6),
+        dpi=600,
+        subplot_kw={"projection": "3d"},
     )
+    ax.view_init(elev=view[0], azim=view[1])
 
     segments = [X[edge, :] for edge in edge_inds]
 
@@ -373,16 +378,6 @@ def visualize_mesh(mesh_data, X_eq=None, hat_X=None):
 
         ax.add_collection(hat_lc)
 
-        hat_face_locs = [hat_X[face, :] for face in faces]
-
-        # hat_mesh = Poly3DCollection(
-        #     hat_face_locs,
-        #     facecolor=(0.8, 0.5, 0.3, 0.3),
-        #     edgecolor="none",
-        # )
-
-        # ax.add_collection(hat_mesh)
-
         nodes = ax.scatter(
             hat_X[:, 0],
             hat_X[:, 1],
@@ -393,7 +388,114 @@ def visualize_mesh(mesh_data, X_eq=None, hat_X=None):
 
     ax.set_aspect("equal")
     fig.tight_layout()
-    plt.show()
+
+    return fig, ax
+
+
+def visualize_mesh_batch(mesh_data, X_eq=None, hat_X=None, view=(30, -60)):
+    """
+    Plots the mesh from mesh_data
+    """
+
+    if X_eq is not None:
+        X = X_eq.detach().numpy()
+    else:
+        X = mesh_data.X.numpy()
+
+    print(X.shape)
+
+    n_edges = mesh_data.n_edges
+    C = mesh_data.C.numpy()
+    n = int(np.sqrt(mesh_data.n_nodes))
+
+    edge_inds = [np.where(C[i, :])[0] for i in range(n_edges)]
+
+    grid_size = int(np.ceil(np.sqrt(hat_X.shape[0])))
+
+    fig, axs = plt.subplots(
+        grid_size,
+        grid_size,
+        figsize=(8, 6),
+        dpi=600,
+        subplot_kw={"projection": "3d"},
+    )
+
+    for ind in range(hat_X.shape[0]):
+        i = ind % grid_size
+        j = ind // grid_size
+
+        axs[i, j].view_init(elev=view[0], azim=view[1])
+
+        segments = [X[ind, edge, :] for edge in edge_inds]
+
+        lc = Line3DCollection(
+            segments,
+            colors="blue",
+            linewidths=0.5,
+        )
+
+        axs[i, j].add_collection(lc)
+
+        faces = []
+        for k in range(n - 1):
+            for l in range(n - 1):
+                faces.append(
+                    (k * n + l, (k + 1) * n + l, (k + 1) * n + (l + 1), k * n + (l + 1))
+                )
+
+        face_locs = [X[ind, face, :] for face in faces]
+
+        mesh = Poly3DCollection(
+            face_locs,
+            facecolor=(0.3, 0.5, 0.8, 0.3),
+            edgecolor="none",
+        )
+
+        axs[i, j].add_collection(mesh)
+
+        nodes = axs[i, j].scatter(
+            X[ind, :, 0],
+            X[ind, :, 1],
+            X[ind, :, 2],
+            s=5,
+            c="black",
+        )
+
+        if hat_X is not None:
+            err = np.linalg.norm((hat_X[ind] - X[ind]), axis=1)
+            max_err_node = np.argmax(err)
+
+            node_sizes = [15 if i == max_err_node else 2 for i in range(hat_X.shape[1])]
+            node_colors = [
+                "orange" if i == max_err_node else "red" for i in range(hat_X.shape[1])
+            ]
+
+            hat_segments = [hat_X[ind, edge, :] for edge in edge_inds]
+
+            hat_lc = Line3DCollection(
+                hat_segments,
+                colors=("red", 0.5),
+                linewidths=0.5,
+            )
+
+            axs[i, j].add_collection(hat_lc)
+
+            nodes = axs[i, j].scatter(
+                hat_X[ind, :, 0],
+                hat_X[ind, :, 1],
+                hat_X[ind, :, 2],
+                s=node_sizes,
+                c=node_colors,
+            )
+
+        axs[i, j].set_aspect("equal")
+        axs[i, j].set_xticklabels([])
+        axs[i, j].set_yticklabels([])
+        axs[i, j].set_zticklabels([])
+
+    fig.tight_layout()
+
+    return fig, axs
 
 
 # %%
@@ -680,10 +782,10 @@ def pointwise_Lp_loss(model, Xs_train, _, p=2, trial_q=None):
     )
 
     err = hat_X - target_X
-
-    loss = err.abs().pow(p).sum(dim=(1, 2)).mean()
-
     err_free = err[:, model.topology.free_ind, :]
+
+    loss = err_free.abs().pow(p).sum(dim=(1, 2)).mean()
+
     err_free_norm = torch.linalg.norm(err_free, dim=2)
 
     mean_dist = err_free_norm.mean()
