@@ -294,6 +294,24 @@ class MeshData:
 
         return X_eq
 
+    def lstsq_q_batched(self, X_goal, p_mats):
+        n_batches = X_goal.shape[0]
+        U = self.C @ X_goal
+        A = torch.einsum("ie, bek->bkie", self.CnT, U).reshape(
+            n_batches, 3 * self.n_free, self.n_edges
+        )
+        b = -p_mats.transpose(1, 2).reshape(n_batches, 3 * self.n_free)
+
+        learnable = self.Cn.abs().sum(1) > 0
+        q_lstsq = torch.zeros(self.Cn.shape[0])
+        q_lstsq_learnable = torch.linalg.lstsq(
+            A[..., learnable], b.unsqueeze(-1)
+        ).solution.squeeze(-1)
+
+        q_lstsq[learnable] = q_lstsq_learnable
+
+        return q_lstsq
+
 
 # %%
 
@@ -816,7 +834,7 @@ def FDM_physics_loss(
 
     loss = residuals.pow(2).mean()
 
-    return loss
+    return loss, edge_forces
 
 
 # %%
@@ -957,6 +975,8 @@ def train_adaptive(
         },
     )
 
+    max_grad_norm = 0.0
+
     # ---------- weighting scheme ----------
     weighting = weighting or LossWeighting()
 
@@ -1011,7 +1031,7 @@ def train_adaptive(
         )
 
         # calculate physics loss
-        loss_physics = physics_loss_fn(
+        loss_physics, _ = physics_loss_fn(
             model,
             t_colloc,
             X,
@@ -1090,6 +1110,15 @@ def train_adaptive(
 
             # backpropagation
             total_loss.backward()
+
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=10.0, norm_type=2.0
+            )
+
+            if total_norm.item() > max_grad_norm:
+                max_grad_norm = total_norm.item()
+                print(total_norm.item())
+
             optimizer.step()
             weighting.step()
 
@@ -1185,7 +1214,10 @@ def train_adaptive(
                 history[f"{k}_val"].append(metrics[k] / len(val_loader))
 
         ##### scheduler
-        scheduler.step(total_val_loss)
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(float(total_val_loss))
+        else:
+            scheduler.step()
 
         # store lr once per epoch
         history["lr"].append(optimizer.param_groups[0]["lr"])

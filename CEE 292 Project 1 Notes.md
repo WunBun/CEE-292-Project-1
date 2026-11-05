@@ -62,7 +62,7 @@ Since they use FDM, the resulting shape will be mechanically sound even if the n
 	- Nodes carry target position, support flag, load
 	- Edges come from the connectivity
 	- Output is an edge-level readout. After message passing, each edge’s embedding (formed from its two endpoint embeddings plus edge features) goes through a small MLP to predict q
-	- Since equilibrium is global and plain message passing only sees about $k$ hops after $k$ layers, I’ll need eitehr many layers or a global context mechanism such as a virtual node connected to all nodes, a pooled global embedding added back to each node, or attention layers like a graph transformer
+	- Since equilibrium is global and plain message passing only sees about $k$ hops after $k$ layers, I’ll need either many layers or a global context mechanism such as a virtual node connected to all nodes, a pooled global embedding added back to each node, or attention layers like a graph transformer
 
 - PyTorch seems like my best bet for library since it can support variable inputs more easily and has the most mature graph neural network library.
 
